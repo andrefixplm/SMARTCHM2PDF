@@ -1,0 +1,11 @@
+# SmartCHM2PDF dependencies
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+playwright>=1.40.0
+pypdf>=4.0.0
+customtkinter>=5.2.0
+
+# CHM extraction (primary) -- requires libchm-dev on Linux:
+#   apt install libchm-dev python3-dev && pip install pychm
+# Fallback: 7-Zip must be on PATH
+#   apt install 7zip  (Linux) / choco install 7zip  (Windows)

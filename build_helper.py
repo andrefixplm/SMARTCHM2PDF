@@ -1,0 +1,318 @@
+"""build_helper.py — interactive wrapper around PyInstaller.
+
+Goal: make .exe builds of Python projects reproducible and avoid the
+classic "missing module / library not found at runtime" errors by
+auto-detecting the entry point, suggesting sensible defaults, and
+injecting the hidden imports / collect directives known to bite GUI
+apps (customtkinter, playwright, bs4, lxml, pychm).
+
+Usage:
+    python build_helper.py                       # interactive
+    python build_helper.py --entry __main__.py   # CLI mode
+    python build_helper.py --spec-only           # just write .spec, no pyinstaller
+"""
+
+from __future__ import annotations
+
+import argparse
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+# Package patterns that almost always need help in PyInstaller for GUI apps.
+KNOWN_HIDDENIMPORTS = [
+    "customtkinter",
+    "playwright.sync_api",
+    "playwright._impl._driver",
+    "playwright._impl._browser",
+    "playwright._impl._browser_context",
+    "playwright._impl._page",
+    "bs4",
+    "lxml",
+    "lxml._elementpath",
+    "lxml.etree",
+    "chm.chmlib",        # pychm optional
+    "PIL",
+    "PIL._imaging",
+    "tkinter",
+]
+
+KNOWN_EXCLUDES = [
+    "tkinter.test",
+    "unittest",
+    "email",
+    "xmlrpc",
+    "pydoc",
+    "doctest",
+    "matplotlib",
+    "numpy.tests",
+    "pytest",
+    "setuptools",
+]
+
+CANDIDATE_ENTRIES = ("run_gui.py", "main.py", "app.py", "__main__.py", "gui/app.py")
+
+
+def detect_project_root(start: Path) -> Path:
+    """Walk up to the first dir that looks like a project (has .py entries or requirements)."""
+    cur = start.resolve()
+    for _ in range(6):
+        if (cur / "requirements.txt").exists() or list(cur.glob("*.py")):
+            return cur
+        cur = cur.parent
+    return start.resolve()
+
+
+def detect_entry(project_dir: Path) -> str | None:
+    """Pick the most likely GUI/CLI entry, prefer file with `if __name__ == '__main__'`."""
+    found: list[Path] = []
+    for cand in CANDIDATE_ENTRIES:
+        p = project_dir / cand
+        if p.exists():
+            found.append(p)
+    if not found:
+        for p in sorted(project_dir.rglob("*.py")):
+            try:
+                txt = p.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            if '__name__ == "__main__"' in txt or "__name__ == '__main__'" in txt:
+                found.append(p)
+        if found:
+            found.sort(key=lambda x: len(x.parts))
+    return str(found[0].relative_to(project_dir)) if found else None
+
+
+def suggested_name(project_dir: Path) -> str:
+    """Use folder name, uppercased."""
+    return project_dir.name.upper()
+
+
+def scan_local_imports(project_dir: Path) -> list[str]:
+    """Grep project .py files for `from X import` / `import X` to gather hiddenimports.
+    Local project modules are EXCLUDED — PyInstaller's Analysis finds them via the
+    import graph when sourced from the entry script. Listing them in hiddenimports
+    actually breaks collection: it marks them as 'handled' but skips bytecode
+    bundling, producing ModuleNotFoundError at runtime.
+    """
+    found: set[str] = set()
+    skip_dirs = {"venv", "build", "dist", ".venv", "__pycache__"}
+    # Build set of local module names (top-level .py + dotted subpackages).
+    local_modules: set[str] = set()
+    for p in project_dir.rglob("*.py"):
+        if any(part in skip_dirs for part in p.relative_to(project_dir).parts):
+            continue
+        rel = p.relative_to(project_dir)
+        parts = rel.with_suffix("").parts
+        # Top-level basename
+        if parts and parts[0] != "__init__":
+            local_modules.add(parts[0])
+        # Dotted path for package files
+        if len(parts) >= 1:
+            local_modules.add(".".join(parts))
+    for p in project_dir.rglob("*.py"):
+        if any(part in skip_dirs for part in p.relative_to(project_dir).parts):
+            continue
+        try:
+            txt = p.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        for line in txt.splitlines():
+            line = line.strip()
+            if line.startswith("from "):
+                mod = line.split()[1].split(".")[0]
+                if mod and mod not in {"__future__"} and mod not in local_modules:
+                    found.add(mod)
+            elif line.startswith("import "):
+                mod = line.split()[1].split(".")[0].rstrip(",")
+                if mod and mod not in {"__future__"} and mod not in local_modules:
+                    found.add(mod)
+    return sorted(found)
+
+
+def render_spec(
+    *,
+    entry_rel: str,
+    app_name: str,
+    onefile: bool,
+    copy_libs: bool,
+    console: bool,
+    icon: str | None,
+    hidden_extra: list[str],
+    output_dir: Path,
+) -> str:
+    hi = sorted(set(KNOWN_HIDDENIMPORTS) | set(hidden_extra))
+    ex = KNOWN_EXCLUDES
+    icon_line = f"icon='{icon}'," if icon else ""
+    return f"""# -*- mode: python ; coding: utf-8 -*-
+# Auto-generated by build_helper.py
+
+import os
+
+block_cipher = None
+
+a = Analysis(
+    ['{entry_rel}'],
+    pathex=['{project_dir_for_spec(output_dir)}'],
+    binaries=[],
+    datas=[],
+    hiddenimports={hi!r},
+    hookspath=[os.path.join(os.path.dirname(os.path.abspath('{output_dir}')), 'hooks')],
+    hooksconfig={{}},
+    runtime_hooks=[],
+    excludes={ex!r},
+    noarchive=False,
+    optimize=0,
+)
+
+pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    [],
+    name='{app_name}',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    runtime_tmpdir=None,
+    console={console},
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+    {icon_line}
+)
+"""
+
+
+def project_dir_for_spec(output_dir: Path) -> str:
+    return str(output_dir.parent.resolve()).replace("\\", "\\\\")
+
+
+def write_spec(path: Path, content: str) -> None:
+    path.write_text(content, encoding="utf-8")
+    print(f"[spec] wrote {path}")
+
+
+def clean_build_artifacts(project_dir: Path) -> None:
+    for d in ("build", "dist"):
+        p = project_dir / d
+        if p.exists():
+            shutil.rmtree(p, ignore_errors=True)
+            print(f"[clean] removed {p}")
+
+
+def run_pyinstaller(spec_path: Path, *, project_dir: Path, noconfirm: bool) -> int:
+    cmd = [sys.executable, "-m", "PyInstaller", str(spec_path)]
+    if noconfirm:
+        cmd.append("--noconfirm")
+    print(f"[run] {' '.join(cmd)}")
+    return subprocess.call(cmd, cwd=str(project_dir))
+
+
+def interactive(args: argparse.Namespace) -> int:
+    project_dir = detect_project_root(args.entry.parent if args.entry else Path.cwd())
+    print(f"[info] project dir: {project_dir}")
+
+    if args.entry:
+        entry = args.entry
+        if not entry.is_absolute():
+            entry = project_dir / entry
+    else:
+        cand = detect_entry(project_dir)
+        if not cand:
+            print("[error] no entry point detected", file=sys.stderr)
+            return 2
+        entry = project_dir / cand
+        print(f"[detect] entry: {cand}")
+
+    if not entry.exists():
+        print(f"[error] entry not found: {entry}", file=sys.stderr)
+        return 2
+
+    entry_rel = str(entry.relative_to(project_dir))
+    app_name = args.name or suggested_name(project_dir)
+    print(f"[detect] app name: {app_name}")
+
+    if args.onefile is None:
+        ans = input("Build mode — (1) onefile  (2) onedir [1]: ").strip() or "1"
+        onefile = ans == "1"
+    else:
+        onefile = args.onefile
+
+    if args.copy_libs is None:
+        ans = input("Aggressively collect package data? (y/N): ").strip().lower()
+        copy_libs = ans == "y"
+    else:
+        copy_libs = args.copy_libs
+
+    spec_only = args.spec_only
+    console_flag = args.console
+
+    hidden_extra = scan_local_imports(project_dir)
+    print(f"[scan] local top-level imports detected: {len(hidden_extra)}")
+
+    spec_path = project_dir / f"{app_name.lower()}.spec"
+    spec_text = render_spec(
+        entry_rel=entry_rel,
+        app_name=app_name,
+        onefile=onefile,
+        copy_libs=copy_libs,
+        console=console_flag,
+        icon=args.icon,
+        hidden_extra=hidden_extra,
+        output_dir=spec_path,
+    )
+
+    if not args.no_clean:
+        clean_build_artifacts(project_dir)
+
+    write_spec(spec_path, spec_text)
+
+    if spec_only:
+        print("[done] spec-only mode, skipping pyinstaller run")
+        return 0
+
+    rc = run_pyinstaller(spec_path, project_dir=project_dir, noconfirm=True)
+    if rc != 0:
+        print(f"[error] pyinstaller exited {rc}", file=sys.stderr)
+        return rc
+    print(f"[done] exe at {project_dir / 'dist' / (app_name + ('.exe' if sys.platform == 'win32' else ''))}")
+    return 0
+
+
+def build_argparser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="PyInstaller build helper.")
+    p.add_argument("--entry", type=Path, help="Path to entry script (auto-detect if omitted)")
+    p.add_argument("--name", help="Output exe name (default: uppercase folder name)")
+    p.add_argument("--onefile", dest="onefile", action="store_true", default=None, help="Single .exe")
+    p.add_argument("--onedir", dest="onefile", action="store_false", default=None, help="Folder build")
+    p.add_argument("--copy-libs", dest="copy_libs", action="store_true", default=None, help="Aggressive collect-all")
+    p.add_argument("--no-copy-libs", dest="copy_libs", action="store_false", default=None)
+    p.add_argument("--console", action="store_true", help="Build console exe (default)")
+    p.add_argument("--windowed", action="store_true", help="Build windowed (no console)")
+    p.add_argument("--icon", help="Path to .ico icon")
+    p.add_argument("--spec-only", action="store_true", help="Write .spec but do not run pyinstaller")
+    p.add_argument("--no-clean", action="store_true", help="Skip removing build/ and dist/")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_argparser().parse_args(argv)
+    if args.windowed:
+        args.console = False
+    elif not args.console:
+        args.console = True
+    return interactive(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

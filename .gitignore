@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+venv/
+.venv/
+env/
+
+build/
+dist/
+*.egg-info/
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+.claude/
+
+*.pdf
+*.chm
+
+# PyInstaller intermediate archive accidentally produced as a loose file.
+l
+
+# Local debug scratch files.
+_dbg.py
