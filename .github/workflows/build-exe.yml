@@ -1,0 +1,55 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install beautifulsoup4 lxml playwright pypdf customtkinter pyinstaller
+          playwright install chromium
+
+      - name: Build EXE with PyInstaller
+        run: pyinstaller SmartCHM2PDF.spec
+
+      - name: Get version tag
+        id: version
+        run: echo "tag=v1.0.${{ github.run_number }}" >> $env:GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "SmartCHM2PDF ${{ steps.version.outputs.tag }}"
+          body: |
+            ## SmartCHM2PDF — Conversor CHM para PDF
+
+            Converte arquivos `.chm` (Microsoft Help) para PDF com imagens, CSS e bookmarks.
+
+            ### Como usar
+            1. Baixe `SmartCHM2PDF.exe`
+            2. Execute — nenhuma instalação necessária
+            3. Selecione o arquivo `.chm` e clique em **Converter**
+
+            > **Nota:** na primeira execução o app precisa encontrar o Chromium.
+            > Caso necessário: `pip install playwright && playwright install chromium`
+          files: dist/SmartCHM2PDF.exe
+          draft: false
+          prerelease: false
